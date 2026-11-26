@@ -1,0 +1,41 @@
+name: Sync Hyphen upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-hyphen-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream main into both fork branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/fxceless/victory-fork.git
+          git fetch upstream main
+          git fetch origin main perfil-5800x-5060ti
+
+          git switch --create sync-main origin/main
+          git merge --no-edit --no-ff upstream/main
+
+          git switch --create sync-profile origin/perfil-5800x-5060ti
+          git merge --no-edit --no-ff sync-main
+
+          git push origin sync-main:main
+          git push origin sync-profile:perfil-5800x-5060ti
