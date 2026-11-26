@@ -6,7 +6,7 @@ Set-Location $repoRoot
 $victory = Join-Path $repoRoot 'target\release\victory.exe'
 if (-not (Test-Path -LiteralPath $victory)) {
     Write-Host 'Building the release executable...'
-    & cargo build --release -p victory
+    & cargo build --release -p victory -j 4
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
