@@ -102,6 +102,12 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With [`masked_patch_now`]: the title's changed bytes under flights'
+    /// shader writes that go to the card's side as a masked patch (a
+    /// dword at a time, only the changed bytes stored) rather than as
+    /// copies of their runs ([`Shadow::merge_under_writes`]). Locked inside
+    /// `dirty`'s lock, `sent` inside it.
+    patch: Mutex<Patch>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
     /// The copy itself, for [`CHANGED`]: set once it is shared.
@@ -440,7 +446,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1280) << 20
     })
 }
 
@@ -468,7 +474,8 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// memory as before.
 fn window_upload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UPLOAD").is_some_and(|v| v == "1"))
+    // On unless `VICTORY_WINDOW_UPLOAD=0`.
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_UPLOAD").is_none_or(|v| v != "0"))
 }
 
 /// A window's buffer in a GPU upload heap and where it is mapped, if
@@ -590,6 +597,171 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
         true
     });
+    out
+}
+
+/// One dword of a masked patch ([`masked_patch_now`]): its byte offset in
+/// the copy (a multiple of 4), the bytes it sets (a mask of whole bytes),
+/// and their values (other bits 0).
+pub(crate) type PatchWord = [u32; 3];
+
+/// A copy's masked patch not yet sent ([`Card::patch`]): its words in the
+/// order they were made, and the byte runs they set.
+#[derive(Default)]
+struct Patch {
+    words: Vec<PatchWord>,
+    ranges: Vec<(usize, usize)>,
+}
+
+/// `VICTORY_MASKED_PATCH`: 0 off, 1 on (the default; run 362: waiting for the card 21 -> 2 ms, usual frame -10 ms), 2 in turn (`alt`).
+pub(crate) fn masked_patch_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_MASKED_PATCH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        Ok("0") => 0,
+        _ => 1,
+    })
+}
+
+/// Set by `crate::host` once the patch's pipeline is made: without it
+/// nothing is patched (the merge gives up and the flights are settled, as
+/// without the switch).
+pub(crate) static PATCH_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a page of a copy in the card's memory whose changed runs under
+/// flights' shader writes are more than `VICTORY_MERGE_RUNS` leaves goes up
+/// as a masked patch instead of the merge giving up and the flights being
+/// settled (`VICTORY_MASKED_PATCH=1`; `alt`: twenty seconds with, twenty
+/// without, in turn, each change said in the log; off by default).
+///
+/// Why: the settles "title memory changed under shader writes" were most of
+/// the submitting thread's wait for the card (run 360: 14-25 ms a frame of
+/// about 20 at 3,300-4,100 draws; run 352: 26-29 of 34-38 in the
+/// preparing's first part), each one the merge giving up "for more changed
+/// runs than VICTORY_MERGE_RUNS leaves". Run 347 raised the cap to 32,768
+/// and it still gave up 6-8 times in five seconds: some pages change in
+/// tens of thousands of runs of a few bytes, equal bytes between. Each run
+/// went up as a copy of its own; the patch is one dispatch whatever their
+/// number: per changed dword its offset, the mask of the changed bytes and
+/// their values, and each thread stores `(old & !mask) | (value & mask)`
+/// into the card's side. It runs on the queue after the flights (in the
+/// next submission's list of ours), so `old` holds what their shaders
+/// wrote, and no byte but the title's changed ones is stored: exact, as the
+/// settle is, with no cap. (`VICTORY_MERGE_GAP` joined runs over equal
+/// bytes, and is not exact for that reason.)
+///
+/// The patched bytes are noted as sent with the other changed ranges, so a
+/// merge of pieces fetched before the patch ran leaves them alone, and
+/// their pieces are hashed again with the others in the same list.
+pub(crate) fn masked_patch_now() -> bool {
+    if !PATCH_READY.load(Ordering::Relaxed) {
+        return false;
+    }
+    match masked_patch_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: AtomicU8 = AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "title bytes under flights' shader writes past the merge's cap, from now (VICTORY_MASKED_PATCH=alt): {}",
+                    if on { "ON, sent as a masked patch" } else { "off, the flights are settled" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the last frame line, of the masked patch: pages patched (each a
+/// give-up of the merge, and a settle, before), dwords, dispatches, and
+/// submissions that sent one.
+pub(crate) static PATCHED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The words of a masked patch for the changed bytes `runs` (offset, bytes;
+/// in order, offsets in `title`) of a page at offset `at` of the copy,
+/// `title` holding the page's new bytes: appended to `out`, one word per
+/// dword touched.
+pub(crate) fn patch_words(at: usize, title: &[u8], runs: &[(usize, usize)], out: &mut Vec<PatchWord>) {
+    for &(r, m) in runs {
+        for k in r..r + m {
+            let offset = at + k;
+            let word = (offset & !3) as u32;
+            let lane = ((offset & 3) * 8) as u32;
+            let (mask, value) = (0xffu32 << lane, u32::from(title[k]) << lane);
+            match out.last_mut() {
+                Some(w) if w[0] == word => {
+                    w[1] |= mask;
+                    w[2] = (w[2] & !mask) | value;
+                }
+                _ => out.push([word, mask, value]),
+            }
+        }
+    }
+}
+
+/// `words` in the order of their offsets, those of one dword folded into
+/// one in the order they were made (a later word's bytes win): the patch's
+/// threads then never store the same dword.
+pub(crate) fn folded(mut words: Vec<PatchWord>) -> Vec<PatchWord> {
+    // Stable: words of one offset keep their order.
+    words.sort_by_key(|w| w[0]);
+    let mut out: Vec<PatchWord> = Vec::with_capacity(words.len());
+    for w in words {
+        match out.last_mut() {
+            Some(last) if last[0] == w[0] => {
+                last[2] = (last[2] & !w[1]) | (w[2] & w[1]);
+                last[1] |= w[1];
+            }
+            _ => out.push(w),
+        }
+    }
+    out
+}
+
+/// What the patch does to a dword (the shader's store, for the tests).
+#[cfg(test)]
+pub(crate) fn patched_word(old: u32, w: PatchWord) -> u32 {
+    (old & !w[1]) | (w[2] & w[1])
+}
+
+/// The masked patches of the copies in the card's memory, taken for the
+/// send numbered `sent_as` ([`card_dirty`]'s): per copy its words, folded
+/// ([`folded`]), and the byte runs they set, joined. With [`relay`] the runs
+/// are noted as sent, as the changed ranges are.
+pub(crate) fn card_patches(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<PatchWord>, Vec<(usize, usize)>)> {
+    let mut out = Vec::new();
+    if masked_patch_mode() == 0 {
+        return out;
+    }
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    for weak in carded.iter() {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let Some(c) = shadow.card.as_ref() else {
+            continue;
+        };
+        let taken = {
+            let _dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut patch = c.patch.lock().unwrap_or_else(|e| e.into_inner());
+            if patch.words.is_empty() {
+                continue;
+            }
+            let taken = std::mem::take(&mut *patch);
+            if relay() {
+                let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
+                sent.retain(|s| s.2 > fetched);
+                sent.extend(taken.ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+            }
+            taken
+        };
+        out.push((shadow.clone(), folded(taken.words), joined(taken.ranges)));
+    }
     out
 }
 
@@ -1491,6 +1663,21 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
+    if kept_threads_now() {
+        let jobs: Vec<Job> = (0..threads)
+            .map(|i| {
+                let at = (i * each).min(len);
+                let n = each.min(len - at);
+                Box::new(move || {
+                    // SAFETY: a part of the caller's ranges; `wide` returns
+                    // only when every part is copied.
+                    unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
+                }) as Job
+            })
+            .collect();
+        wide(jobs);
+        return;
+    }
     std::thread::scope(|s| {
         for i in 0..threads {
             let at = (i * each).min(len);
@@ -1534,7 +1721,7 @@ type Job = Box<dyn FnOnce() + Send>;
 
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
-struct Workers {
+pub(crate) struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
 }
@@ -1542,15 +1729,25 @@ struct Workers {
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
-    let workers = WORKERS.get_or_init(|| Workers {
+    let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+    kept_pool(&WORKERS, &STARTED, "victory-wide", n)
+}
+
+/// The kept threads of a pool: `n` threads named `name-i`, started once.
+fn kept_pool(
+    cell: &'static std::sync::OnceLock<Workers>,
+    started: &'static std::sync::Once,
+    name: &'static str,
+    n: usize,
+) -> &'static Workers {
+    let workers = cell.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
     });
-    STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+    started.call_once(|| {
         for i in 0..n {
-            let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
-                let workers = WORKERS.get().expect("made above");
+            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                let workers = cell.get().expect("made above");
                 loop {
                     let job = {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1569,16 +1766,31 @@ fn workers() -> &'static Workers {
     workers
 }
 
+/// The kept threads that bring textures up to date ahead of their
+/// submission (`HostList::refresh_textures_ahead`, on the heap worker's
+/// thread): three and the caller, a pool of their own, so that the
+/// submitting thread never runs a texture's work (and its locks) inside its
+/// own [`wide`], nor waits behind it.
+pub(crate) fn ahead_workers() -> &'static Workers {
+    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    kept_pool(&WORKERS, &STARTED, "victory-ahead", 7)
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
+    wide_in(workers(), jobs);
+}
+
+/// [`wide`] on the pool `workers`.
+fn wide_in(workers: &'static Workers, jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
             job();
         }
         return;
     }
-    let workers = workers();
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1612,6 +1824,65 @@ fn wide(jobs: Vec<Job>) {
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// Whether short-lived parallel work (texture refreshes ahead, big copies and
+/// compares) runs on the kept threads of [`wide`] instead of threads spawned
+/// for each call (`VICTORY_KEPT_THREADS`: 1 the default, 0 spawned as before,
+/// `alt` twenty seconds each in turn, each change said in the log). A spawned
+/// thread costs its creation, the title's thread-attach callbacks, and a
+/// fresh thread-local read buffer grown (zero-filled) to the largest texture
+/// it reads, freed again when it ends: some 5 flushes a frame of 4 threads.
+pub(crate) fn kept_threads_now() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_KEPT_THREADS").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "parallel host work from now (VICTORY_KEPT_THREADS=alt): {}",
+                    if on { "ON, on the kept threads" } else { "off, threads spawned per call" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// [`wide`] for jobs that borrow from the caller: returns only when every
+/// job has run, and a panic in one is caught where it ran and raised again
+/// here after all of them are done (so no borrow outlives this call).
+pub(crate) fn wide_scoped<'a>(workers: &'static Workers, jobs: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+    let panicked: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> = Arc::new(Mutex::new(None));
+    let jobs: Vec<Job> = jobs
+        .into_iter()
+        .map(|job| {
+            let panicked = panicked.clone();
+            let job: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+                    *panicked.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                }
+            });
+            // SAFETY: `wide` returns only after every job it was given has
+            // run to its end (a job cannot unwind past the catch above), so
+            // nothing the job borrows for `'a` is used after this call.
+            unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Job>(job) }
+        })
+        .collect();
+    wide_in(workers, jobs);
+    let caught = panicked.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(e) = caught {
+        std::panic::resume_unwind(e);
+    }
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -1802,10 +2073,114 @@ pub(crate) fn back_line(frames: f64) {
 }
 
 #[cfg(test)]
+mod masked_patch_tests {
+    use super::{PatchWord, folded, patch_words, patched_word};
+
+    /// The patch stores the title's changed bytes and nothing else: every
+    /// byte a "flight" wrote on the card between them stays, however many
+    /// runs there are and wherever they fall in their dwords.
+    #[test]
+    fn the_patch_stores_only_the_changed_bytes() {
+        let n = 4096usize;
+        let at = 3 * 65536 + 4; // the page's offset in the copy (a multiple of 4)
+        let old: Vec<u8> = (0..n).map(|i| (i * 7 + 1) as u8).collect();
+        // The title changes every third byte and a long run.
+        let mut title = old.clone();
+        for i in (0..n).step_by(3) {
+            title[i] ^= 0x5a;
+        }
+        for b in &mut title[1000..1100] {
+            *b = !*b;
+        }
+        let runs = super::changed_runs(&title, &old);
+        assert!(runs.len() > 1000);
+        // The card's side after the flights: the old bytes, but a flight
+        // stored into bytes the title did not change.
+        let mut card = old.clone();
+        let mut flight = vec![false; n];
+        for i in (1..n).step_by(5) {
+            if title[i] == old[i] {
+                card[i] = 0xee;
+                flight[i] = true;
+            }
+        }
+        let mut words: Vec<PatchWord> = Vec::new();
+        patch_words(at, &title, &runs, &mut words);
+        let words = folded(words);
+        for w in &words {
+            assert_eq!(w[0] % 4, 0);
+            let k = w[0] as usize - at;
+            let mut dword = [0u8; 4];
+            dword.copy_from_slice(&card[k..k + 4]);
+            let new = patched_word(u32::from_le_bytes(dword), *w).to_le_bytes();
+            card[k..k + 4].copy_from_slice(&new);
+        }
+        for i in 0..n {
+            let want = if flight[i] { 0xee } else { title[i] };
+            assert_eq!(card[i], want, "byte {i}");
+        }
+    }
+
+    /// Words of one dword made at different times fold into one, the later
+    /// bytes winning, in offset order.
+    #[test]
+    fn words_of_one_dword_fold_in_order() {
+        let words = vec![[8, 0x0000_00ff, 0x11], [0, 0xff00_0000, 0x2200_0000], [8, 0x0000_ffff, 0x3344]];
+        assert_eq!(folded(words), vec![[0, 0xff00_0000, 0x2200_0000], [8, 0x0000_ffff, 0x3344]]);
+        let mut out = Vec::new();
+        patch_words(0, &[1, 2, 3, 4, 5, 6], &[(1, 2), (5, 1)], &mut out);
+        assert_eq!(out, vec![[0, 0x00ff_ff00, 0x0003_0200], [4, 0x0000_ff00, 0x0000_0600]]);
+    }
+}
+
+#[cfg(test)]
 mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Borrowed jobs all run before `wide_scoped` returns, on either pool,
+    /// and a panic in one comes back to the caller only after the others ran.
+    #[test]
+    fn scoped_jobs_borrow_and_panics_come_back() {
+        use super::{ahead_workers, wide_scoped, workers};
+        for pool in [workers(), ahead_workers()] {
+            let mut slots = vec![0u64; 37];
+            {
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> =
+                    slots.iter_mut().enumerate().map(|(i, s)| Box::new(move || *s = i as u64 * 3) as Box<dyn FnOnce() + Send + '_>).collect();
+                wide_scoped(pool, jobs);
+            }
+            assert!(slots.iter().enumerate().all(|(i, &s)| s == i as u64 * 3));
+            let ran = AtomicUsize::new(0);
+            let ran_ref = &ran;
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = (0..9)
+                    .map(|i| {
+                        Box::new(move || {
+                            if i == 4 {
+                                panic!("job 4");
+                            }
+                            ran_ref.fetch_add(1, Ordering::SeqCst);
+                        }) as Box<dyn FnOnce() + Send + '_>
+                    })
+                    .collect();
+                wide_scoped(pool, jobs);
+            }));
+            assert!(caught.is_err());
+            assert_eq!(ran.load(Ordering::SeqCst), 8);
+        }
+    }
+
+    /// The kept-thread copy and compare give what the spawned ones gave.
+    #[test]
+    fn kept_copy_is_whole() {
+        let src: Vec<u8> = (0..(40usize << 20)).map(|i| (i * 31 + 7) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        // SAFETY: two separate allocations of the same length.
+        unsafe { super::copy_wide(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
+        assert!(src == dst);
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -3300,6 +3675,20 @@ impl Shadow {
             (at - (start + at) % PIECE).max(from)
         };
         let scan = &scan;
+        if kept_threads_now() {
+            let parts: Vec<Mutex<Vec<(usize, usize)>>> = (0..threads).map(|_| Mutex::new(Vec::new())).collect();
+            let parts_ref = &parts;
+            let jobs: Vec<Box<dyn FnOnce() + Send + '_>> = (0..threads)
+                .map(|i| {
+                    let (a, b) = (cut(i), cut(i + 1));
+                    Box::new(move || {
+                        *parts_ref[i].lock().unwrap_or_else(|e| e.into_inner()) = scan(a, b);
+                    }) as Box<dyn FnOnce() + Send + '_>
+                })
+                .collect();
+            wide_scoped(workers(), jobs);
+            return parts.into_iter().flat_map(|p| p.into_inner().unwrap_or_else(|e| e.into_inner())).collect();
+        }
         std::thread::scope(|s| {
             let parts: Vec<_> = (0..threads)
                 .map(|i| {
@@ -3520,15 +3909,28 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
-                        MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
-                        return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        // Past the cap: the page's exact changed bytes as a
+                        // masked patch ([`masked_patch_now`]), no settle.
+                        if masked_patch_now() && at + n <= u32::MAX as usize {
+                            let exact = changed_runs(title, held);
+                            self.card_patched(at, title, &exact);
+                            for &(r, m) in &exact {
+                                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                            }
+                        } else {
+                            MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                            return true;
+                        }
+                    } else {
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3929,6 +4331,27 @@ impl Shadow {
         }
     }
 
+    /// The page at offset `at` of a copy in the card's memory takes the
+    /// title's bytes `title` at the changed runs `runs` (offsets in `title`)
+    /// as a masked patch ([`masked_patch_now`]), sent before the next
+    /// submission ([`card_patches`]).
+    fn card_patched(&self, at: usize, title: &[u8], runs: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        if runs.is_empty() {
+            return;
+        }
+        let mut words = Vec::new();
+        patch_words(at, title, runs, &mut words);
+        PATCHED[0].fetch_add(1, Ordering::Relaxed);
+        PATCHED[1].fetch_add(words.len() as u64, Ordering::Relaxed);
+        let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
+        patch.words.extend(words);
+        patch.ranges.extend(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
@@ -4129,10 +4552,12 @@ impl Shadow {
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let patch = card.patch.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             dirty
                 .iter()
                 .copied()
+                .chain(patch.ranges.iter().copied())
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
                 .filter(|&(a, b)| a < at + n && b > at)
                 .collect()
@@ -4513,6 +4938,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    patch: Mutex::default(),
                     size,
                     me: std::sync::OnceLock::new(),
                 };
@@ -4610,6 +5036,8 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off unless `VICTORY_WINDOW_TAILS=1` (with a 512 KiB grid, run 354: the
+    // preparing thread's lists' steps 44-68 ms against 31-33).
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
 }
 
@@ -4748,6 +5176,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                patch: Mutex::default(),
                 size: len,
                 me: std::sync::OnceLock::new(),
             };
@@ -5030,6 +5459,7 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                patch: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
                 me: std::sync::OnceLock::new(),
