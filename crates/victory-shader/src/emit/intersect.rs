@@ -63,9 +63,10 @@ fn no_hit() -> bool {
         #[cfg(test)]
         return TEST_NO_HIT.get();
     }
-    // On unless `VICTORY_BVH_NO_HIT=0` or the builder runs (`VICTORY_BVH_BUILDER=1`).
+    // Only while the builder is off (`VICTORY_BVH_BUILDER=0`; it runs by
+    // default), and not with `VICTORY_BVH_NO_HIT=0`.
     std::env::var_os("VICTORY_BVH_NO_HIT").is_none_or(|v| v != "0")
-        && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+        && std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "0")
 }
 
 /// Where the instruction's node is.
@@ -242,9 +243,13 @@ impl<'a> Lower<'a> {
         let triangle_end = self.cur;
         self.s.m.terminate(triangle_end, Term::Br(join));
         self.cur = join;
-        // Kinds 6 and 7 (an instance, a procedural primitive): not known
-        // what the console returns; the title's programs do not read it.
-        let other = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+        // Kinds 6 and 7 (an instance, a procedural primitive): the hardware
+        // returns 0xFFFFFFFF in all four dwords (AMD GPURT
+        // IntersectCommon.hlsl: "User defined node. HW returns -1"); a
+        // traversal tells such a node by that answer and handles it itself
+        // (an instance: the ray goes into the object's structure). This
+        // returned a miss before (rt-format audit).
+        let other = [u32::MAX; 4].map(|v| self.s.m.i32(v));
         let i32t = self.s.t.i32;
         let mut results = Vec::with_capacity(4);
         for k in 0..4 {
@@ -289,7 +294,7 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at);
         }
-        self.memory(low, high, guard)
+        self.memory(low, high, guard, false)
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`

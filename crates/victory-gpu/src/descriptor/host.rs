@@ -2885,6 +2885,29 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
+/// The title address a shader takes of buffer view `view`: a ray-tracing
+/// structure's view (dimension 11) has no resource and names its structure
+/// by address (`RaytracingAccelerationStructure.Location`, words 4-5); any
+/// other buffer view, its range's start ([`buffer_range`]). Before this,
+/// structure views gave 0 (no resource): the programs that walk the
+/// structures read page 0, an all-zero node, and every ray missed (runs
+/// 372-375: "a shader takes the address of a buffer view that is not there").
+pub(crate) fn view_address(view: &View) -> Option<u64> {
+    const STRUCTURE: u32 = 11;
+    let words = match view {
+        View::Shader(_, Some(desc)) => Some(&desc[..]),
+        View::Placed(false, _, desc) => Some(&desc[..10]),
+        _ => None,
+    };
+    if let Some(w) = words
+        && w[1] == STRUCTURE
+    {
+        let at = u64::from(w[4]) | u64::from(w[5]) << 32;
+        return (at != 0).then_some(at);
+    }
+    buffer_range(view).map(|range| range.0)
+}
+
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
