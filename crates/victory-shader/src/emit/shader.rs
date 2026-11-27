@@ -63,7 +63,11 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
-///   host reads afterwards to make those copies for the frames to come.
+///   host reads afterwards to make those copies for the frames to come;
+///   after them, [`MEMORY_PAGES`] dwords, one per page: a store or atomic
+///   through an address sets its page's dword to 1 (the host reads and
+///   clears them, and copies back only pages shaders wrote). The buffer is
+///   [`MEMORY_NOTES`] dwords in all.
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
@@ -71,6 +75,9 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Dwords of the [`SLOT_FAULTS`] buffer in all: the fault notes, then one
+/// written flag per directory page (dword [`MEMORY_FAULTS`] + page).
+pub const MEMORY_NOTES: u32 = MEMORY_FAULTS + MEMORY_PAGES;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
